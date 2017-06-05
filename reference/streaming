@@ -1,0 +1,595 @@
+// Databricks notebook source
+// MAGIC %md
+// MAGIC 
+// MAGIC ### Output Sinks
+// MAGIC 
+// MAGIC The _Output_ is the external storage—the _sink_. Several kinds of sinks are built into the API. (We'll discuss output modes shortly.)
+// MAGIC 
+// MAGIC | Sink Type       | Supported Output Modes  | Description |
+// MAGIC | --------------- | ----------------------- | ------------ |
+// MAGIC | **File**        | Append                  | Dumps the Result Table to a file. Only supports Parquet in 2.0 and 2.1. Supports writing to partitioned tables. (Partitioning by time might be useful) |
+// MAGIC | **Console**     | Append, Complete        | Writes the data to the console. Only useful for debugging. |
+// MAGIC | **Memory**      | Append, Complete        | Writes the data to an in-memory table, which can be queried through Spark SQL or the DataFrame API. |
+// MAGIC | **Foreach**     | All modes               | This is your "escape hatch", allowing you to write your own sink type. More on this later. |
+// MAGIC 
+// MAGIC 
+// MAGIC Note that, within Databricks, "console" doesn't work very well. However, we _can_ pass the streaming DataFrame to the `display()` function, which is conceptually similar. We'll see an example of that shortly.
+// MAGIC 
+// MAGIC ### Output Modes
+// MAGIC 
+// MAGIC Two output modes are currently supported.
+// MAGIC 
+// MAGIC | Mode          | Description |
+// MAGIC | ------------- | ----------- |
+// MAGIC | Complete      | The entire updated Result Table is written to the sink. The individual sink implementation decides how to handle writing the entire table. |
+// MAGIC | Append        | Only the new rows appended to the Result Table since the last trigger are written to the sink. This is only useful if the existing rows in the Result Table are not changed. |
+
+// COMMAND ----------
+
+// MAGIC %md
+// MAGIC ## Creating a Streaming DataFrame
+// MAGIC 
+// MAGIC So, how do you create a streaming DataFrame? As with regular DataFrames, you start with the `SparkSession`. We already have one available to us in the notebook, called `spark`.
+// MAGIC 
+// MAGIC Here's a simple example. We're going to consume log data that looks something like this:
+// MAGIC 
+// MAGIC ```
+// MAGIC [2016/12/22 17:23:49.506] (WARN) Backup server 192.168.182.194 is offline.
+// MAGIC [2016/12/22 17:23:49.506] (INFO) Pinging watchdog timer process: Process is alive.
+// MAGIC [2016/12/22 17:23:49.506] (INFO) Backed up all server logs.
+// MAGIC [2016/12/22 17:23:49.506] (INFO) Rolling 8 log file(s)...
+// MAGIC [2016/12/22 17:23:49.507] (INFO) Flushed 22 buffers to disk.
+// MAGIC [2016/12/22 17:23:49.507] (INFO) Backed up all server logs.
+// MAGIC [2016/12/22 17:23:49.507] (INFO) Network heartbeat check: All OK.
+// MAGIC ...
+// MAGIC ```
+// MAGIC 
+// MAGIC We'll start by reading this data and filtering out anything that isn't an error.
+// MAGIC 
+// MAGIC First, let's define some constants and pull in some imports that we'll use here and elsewhere in the notebook.
+
+// COMMAND ----------
+
+import org.apache.spark.sql.functions._ 
+// Constants that define the location of our streaming server.
+val LogHost            = "54.187.66.67"
+val LogPort            = 9001
+val WikipediaEditsHost = LogHost
+val WikipediaEditsPort = 9002
+val KafkaServers       = s"$WikipediaEditsHost:9092"
+
+// COMMAND ----------
+
+val logsDF = spark.readStream
+  .format("socket")
+  .option("host", LogHost)
+  .option("port", LogPort)
+  .load()
+
+// COMMAND ----------
+
+val errorsDF = logsDF
+  .select(unix_timestamp($"value".substr(2, 23), "yyyy/MM/dd HH:mm:ss.SSS").cast("timestamp").as("timestamp"),
+          regexp_extract($"value", """^.*\]\s+(.*)$""", 1).as("logData"))
+  .filter($"value" like "% (ERROR) %")
+
+// COMMAND ----------
+
+val logTimestampsDF = logsDF.select(unix_timestamp($"value".substr(2, 23), "yyyy/MM/dd HH:mm:ss.SSS").cast("timestamp").as("timestamp"))
+
+// COMMAND ----------
+
+spark.conf.set("spark.sql.shuffle.partitions", 8)
+
+// COMMAND ----------
+
+val messagesPerSecond = logTimestampsDF.groupBy(window($"timestamp", "1 second")).count()
+messagesPerSecond.printSchema
+
+// COMMAND ----------
+
+display(messagesPerSecond.select($"window.start".as("start"), $"window.end".as("end"), $"count"))
+
+// COMMAND ----------
+
+display(errorsDF.withWatermark("timestamp", "1 minute").groupBy(window($"timestamp", "1 second")).count())
+
+// COMMAND ----------
+
+// MAGIC %md
+// MAGIC ## Exercise
+// MAGIC 
+// MAGIC Some of the log messages have IP addresses in them. How many log messages are coming from each IP address?
+// MAGIC 
+// MAGIC To solve this problem, you need to:
+// MAGIC 
+// MAGIC 1. filter out the records that don't contain IP addresses,
+// MAGIC 2. parse the IP address from the records that remain, 
+// MAGIC 3. perform an aggregation over a window of time, grouping by timestamp and IP address, and
+// MAGIC 4. count the unique IP addresses within the window.
+// MAGIC 
+// MAGIC Use a 10-second window that slides every second. 
+// MAGIC 
+// MAGIC Your final DataFrame, the one you pass to `display()`, should have three columns:
+// MAGIC 
+// MAGIC * `ip`: The IP address
+// MAGIC * `count`: The number of times that IP address appeared in the window
+// MAGIC * `window`: The window column
+// MAGIC 
+// MAGIC A regular expression is the easiest way to perform steps 1 and 2, and we've already started the solution for you, below. See if you can finish the exercise.
+// MAGIC 
+// MAGIC **Question** Should you use watermarking or not? Think about that, and we'll discuss it afterwards.
+// MAGIC 
+// MAGIC **References**
+// MAGIC 
+// MAGIC For additional information see the `regexp_extract()`, `length()` and `window()` functions, in [org.apache.spark.sql.functions (Scala)](http://spark.apache.org/docs/latest/api/scala/index.html#org.apache.spark.sql.functions) or [pyspark.sql.function (Python)](http://spark.apache.org/docs/latest/api/python/pyspark.sql.html#module-pyspark.sql.functions)
+
+// COMMAND ----------
+
+val IP = """^.*\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}).*$"""
+val ipDF = errorsDF
+  .select(regexp_extract($"logData", IP, 1).as("ip"), $"timestamp")
+  .filter($"ip".notEqual("")) // How can you tell that an IP was wasn't parsed? Hint: You'll have to read the docs for regexp_extract().
+//   .groupBy($"timestamp", $"ip").agg(count($"ip"))
+  .groupBy(window($"timestamp", "30 second", "20 second"), $"ip")
+  .count()
+  .sort(desc("count"))
+  .filter($"count" >= 5)
+
+// COMMAND ----------
+
+display(ipDF)
+// display(ipDF.select($"window.end").as("time"), $"ip", $"count")
+
+// COMMAND ----------
+
+// ANSWER
+val IP = """^.*\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}).*$"""
+val ipDF = errorsDF
+  .select(regexp_extract($"logData", IP, 1).as("ip"), $"timestamp")
+  .filter(length($"ip") > 0)
+  .groupBy(window($"timestamp", "10 second", "1 second"), $"ip")
+  .count()
+
+// COMMAND ----------
+
+display(ipDF.select($"window.end").as("time"), $"ip", $"count")
+
+// COMMAND ----------
+
+// MAGIC %md
+// MAGIC ## End-to-end Fault Tolerance
+// MAGIC 
+// MAGIC Structured Streaming ensures end-to-end exactly-once fault-tolerance guarantees through _checkpointing_ and _Write Ahead Logs_.
+// MAGIC 
+// MAGIC Structured Streaming sources, sinks, and the underlying execution engine work together to track the progress of stream processing. If a failure occurs, the streaming engine attempts to restart and/or reprocess the data.
+// MAGIC 
+// MAGIC This approach _only_ works if the streaming source is replayable. To ensure fault-tolerance, Structured Streaming assumes that every streaming source has offsets, akin to:
+// MAGIC 
+// MAGIC * [Kafka message offsets](https://kafka.apache.org/documentation/#intro_topics)
+// MAGIC * [Kinesis sequence numbers](http://docs.aws.amazon.com/streams/latest/dev/key-concepts.html#sequence-number)
+// MAGIC 
+// MAGIC At a high level, the underlying streaming mechanism relies on a couple approaches:
+// MAGIC 
+// MAGIC * First, Structured Streaming uses checkpointing and write-ahead logs to record the offset range of data being processed during each trigger interval.
+// MAGIC * Next, the streaming sinks are designed to be _idempotent_—that is, multiple writes of the same data (as identified by the offset) do _not_ result in duplicates being written to the sink.
+// MAGIC 
+// MAGIC Taken together, replayable data sources and idempotent sinks allow Structured Streaming to ensure **end-to-end, exactly-once semantics** under any failure condition.
+// MAGIC 
+// MAGIC **Question for discussion: Why is the TCP source not considered fault-tolerant?**
+
+// COMMAND ----------
+
+// MAGIC %md
+// MAGIC ## Checkpointing
+// MAGIC 
+// MAGIC Checkpointing is useful when you want to recover from a previous failure or an intentional shutdown. With checkpointing enabled, you can recover the previous progress and state of the streaming query that was running when the system stopped, and your job can continue where it left off.
+// MAGIC 
+// MAGIC To enable checkpointing, you configure a Structured Streaming query with a checkpoint location. During processing, the query will save:
+// MAGIC 
+// MAGIC * the progress data—that is, the range of offsets processed by each trigger
+// MAGIC * the values of the running aggregates
+// MAGIC 
+// MAGIC The checkpoint location must be a path to an HDFS-compatible file system, and it's just another option on the output sink.
+// MAGIC 
+// MAGIC For instance:
+
+// COMMAND ----------
+
+// MAGIC %fs rm --recurse=true dbfs:/tmp/checkpoint
+
+// COMMAND ----------
+
+// MAGIC %fs mkdirs dbfs:/tmp/checkpoint
+
+// COMMAND ----------
+
+val IP = """^.*\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}).*$"""
+val ipDF = errorsDF
+  .select(regexp_extract($"logData", IP, 1).as("ip"), $"timestamp")
+  .filter(length($"ip") > 0)
+  .groupBy(window($"timestamp", "10 second", "1 second"), $"ip")
+  .count()
+
+ipDF
+  .writeStream
+  .outputMode("complete")
+  .option("checkpointLocation", "dbfs:/tmp/checkpoint")
+  .format("memory")
+  .queryName("ipaddresses")
+  .start()
+
+// COMMAND ----------
+
+// MAGIC %fs ls dbfs:/tmp/checkpoint/
+
+// COMMAND ----------
+
+// MAGIC %fs head /tmp/checkpoint/metadata
+
+// COMMAND ----------
+
+// MAGIC %md
+// MAGIC ## Production Streaming with Kafka
+// MAGIC 
+// MAGIC Okay, let's do something more complicated. We have another server that reads Wikipedia edits in real time, for some number of Wikipedia languages. 
+
+// COMMAND ----------
+
+// MAGIC %md 
+// MAGIC ### Kafka
+// MAGIC 
+// MAGIC The following function reads the Wikipedia edit data from a Kafka server. The Kafka server is fed by a separate TCP server that reads the Wikipedia edits, in real time, from the various language-specific IRC channels to which Wikimedia posts them. That server parses the IRC data, converts the results to JSON, and sends the JSON to:
+// MAGIC 
+// MAGIC * any directly connected TCP clients. TCP clients receive data for _all_ languages the server is monitoring.
+// MAGIC * a Kafka server, with the edits segregated by language. That is, Kafka topic "en" corresponds to edits for en.wikipedia.org.
+// MAGIC 
+// MAGIC In general, using Kafka is the better choice, as it provides end-to-end fault-tolerance guarantees. 
+// MAGIC 
+// MAGIC For details on reading structured streams from Kafka, see 
+// MAGIC [The Structured Streaming + Kafka Integration Guide](https://people.apache.org//~pwendell/spark-nightly/spark-branch-2.1-docs/latest/structured-streaming-kafka-integration.html).
+// MAGIC 
+// MAGIC **NOTE**: The Kafka server must be Kafka broker version 0.10.0 or higher.
+
+// COMMAND ----------
+
+// Reading from Kafka returns a DataFrame with the following fields:
+//
+// key           - the data key (we don't need this)
+// value         - the data, in binary format. This is our JSON payload. We'll need to cast it to STRING.
+// topic         - the topic. In this case, the topic is the same as the "wikipedia" field, so we don't need it.
+// partition     - partition. This server only has one partition, so we don't need this information.
+// offset        - the offset value. We're not using it.
+// timestamp     - the timestamp. We'll keep this, as it's useful for windowing
+// timestampType - not needed
+//
+// We're keeping just the value, as a STRING, to return the same shape of DataFrame as 
+// getTCPStream() does.
+val editsDF = spark.readStream
+  .format("kafka")
+  .option("kafka.bootstrap.servers", KafkaServers)
+  .option("checkpointLocation", "dbfs:/tmp/checkpoint")
+  .option("subscribePattern", "e[ns]")
+  .load()
+//   .select($"value".cast("STRING").as("value"), 'topic.cast("STRING").as("topic"), 'offset.cast("STRING").as("offset"), $"timestamp")
+  .select($"value".cast("STRING").as("value"), $"timestamp")
+
+// COMMAND ----------
+
+display(editsDF)
+
+// COMMAND ----------
+
+// MAGIC %md
+// MAGIC 
+// MAGIC ### Required Options
+// MAGIC 
+// MAGIC When consuming from a Kafka source, you _must_ specify:
+// MAGIC 
+// MAGIC 1. The Kafka bootstrap servers (option "kafka.bootstrap.servers")
+// MAGIC 2. Some indication of the topics you want to consume.
+// MAGIC 
+// MAGIC There are three mutually-exclusive ways to define #2:
+// MAGIC 
+// MAGIC | Option             | Value                                          | Description                            | Example |
+// MAGIC | ------------------ | ---------------------------------------------- | -------------------------------------- | ------- |
+// MAGIC | "subscribe"        | A comma-separated list of topics               | A list of topics to which to subscribe | `"topic1"`, or `"topic1,topic2,topic3"`
+// MAGIC | "assign"           | A JSON string indicating topics and partitions | Specific topic-partitions to consume.  | `{"topic1": [1,3], "topic2": [2,5]}`
+// MAGIC | "subscribePattern" | A (Java) regular expression                    | A pattern to match desired topics      | `"e[ns]"`, `"topic[123]"`
+// MAGIC 
+// MAGIC 
+// MAGIC Note that we're using the "subscribe" option in the above code to select the topics we're interested in consuming. We've selected only the "en" topic here, corresponding to edits for the English Wikipedia. If we wanted to consume multiple topics (multiple Wikipedia languages, in our case), we could just specify them as a comma-separate list:
+// MAGIC 
+// MAGIC ```
+// MAGIC .option("subscribe", "en,es,it,fr,de,eo")
+// MAGIC ```
+// MAGIC 
+// MAGIC #### But what about partitions?
+// MAGIC 
+// MAGIC As it happens, the Kafka server from which we're reading only has a single partition, so we don't have to worry about partitions in this notebook.
+// MAGIC 
+// MAGIC #### Other options
+// MAGIC 
+// MAGIC There are other, optional, arguments you can give the Kafka source. See [the integration guide](http://spark.apache.org/docs/latest/structured-streaming-kafka-integration.html#creating-a-kafka-source-stream) for details.
+
+// COMMAND ----------
+
+editsDF.printSchema
+
+// COMMAND ----------
+
+// MAGIC %md 
+// MAGIC 
+// MAGIC ### The JSON
+// MAGIC 
+// MAGIC Spark 2.1 has a [SQL function][functions] called `from_json()` that takes an input column of JSON data and produces a structured output column. To call that function, we need to:
+// MAGIC 
+// MAGIC * import the appropriate package
+// MAGIC * provide a schema for the JSON
+// MAGIC 
+// MAGIC Let's connect to the TCP server (not the Kafka server) and take a look at one line of the JSON, to see how to create the schema.
+// MAGIC 
+// MAGIC [functions]: https://people.apache.org/~pwendell/spark-nightly/spark-branch-2.1-docs/latest/api/scala/index.html#org.apache.spark.sql.functions$
+
+// COMMAND ----------
+
+import spray.json._
+import java.net.{InetAddress, Socket}
+import scala.io.Source
+
+val addr = InetAddress.getByName(WikipediaEditsHost)
+val socket = new Socket(addr, WikipediaEditsPort)
+val jsonString = Source.fromInputStream(socket.getInputStream).getLines.next
+socket.close()
+println(jsonString.parseJson.prettyPrint)
+
+
+
+// COMMAND ----------
+
+val json_df = spark.read.json(sc.parallelize(Array(jsonString)))
+json_df.printSchema
+
+// COMMAND ----------
+
+json_df.select("channel", "delta", "flag", "page", "pageURL", "url", "wikipedia").show(20,false)
+
+// COMMAND ----------
+
+val inferredSchema = spark.read.json(sc.parallelize(Array(jsonString))).schema
+
+import org.apache.spark.sql.types._
+
+// Let's craft a simple function to print the schema in code-friendly form.
+// Don't worry if this doesn't make sense. It's not really relevant to streaming.
+def prettySchema(schema: StructType, indentation: Int = 2): String = {
+  def prettyStruct(st: StructType, indentationLevel: Int): String = {
+    val indentSpaces = " " * (indentationLevel * indentation)
+    val prefix = s"${indentSpaces}StructType(List(\n"
+    val fieldIndentSpaces = " " * ((indentationLevel + 1) * indentation)
+    val fieldStrings: Seq[String] = for (field <- st.fields) yield {
+      val fieldPrefix = s"""${fieldIndentSpaces}StructField("${field.name}", """
+
+      val fieldType = field.dataType match {
+        case st2: StructType =>  s"${prettyStruct(st2, indentationLevel + 1)}"
+        case _               =>  s"${field.dataType}"
+      }
+      
+      s"$fieldPrefix$fieldType, ${field.nullable})"
+    }
+    val fields = fieldStrings.mkString(",\n")
+    s"$prefix$fields\n$indentSpaces))"
+  }
+  
+  prettyStruct(schema, 0)
+}
+
+println(prettySchema(inferredSchema))
+
+// COMMAND ----------
+
+val schema = StructType(List(
+  StructField("channel", StringType, true),
+  StructField("comment", StringType, true),
+  StructField("delta", IntegerType, true),
+  StructField("flag", StringType, true),
+  StructField("geocoding", StructType(List(
+    StructField("city", StringType, true),
+    StructField("country", StringType, true),
+    StructField("countryCode2", StringType, true),
+    StructField("countryCode3", StringType, true),
+    StructField("stateProvince", StringType, true),
+    StructField("latitude", DoubleType, true),
+    StructField("longitude", DoubleType, true)
+  )), true),
+  StructField("isAnonymous", BooleanType, true),
+  StructField("isNewPage", BooleanType, true),
+  StructField("isRobot", BooleanType, true),
+  StructField("isUnpatrolled", BooleanType, true),
+  StructField("namespace", StringType, true),
+  StructField("page", StringType, true),
+  StructField("pageURL", StringType, true),
+  StructField("timestamp", StringType, true),
+  StructField("url", StringType, true),
+  StructField("user", StringType, true),
+  StructField("userURL", StringType, true),
+  StructField("wikipediaURL", StringType, true),
+  StructField("wikipedia", StringType, true)
+))
+
+// COMMAND ----------
+
+// MAGIC %md 
+// MAGIC 
+// MAGIC ### What _are_ these fields, anyway?
+// MAGIC 
+// MAGIC We'll be keeping some of the fields and discarding others. Here's a description of the various fields.
+// MAGIC 
+// MAGIC 
+// MAGIC #### The fields we're keeping:
+// MAGIC 
+// MAGIC Here are the fields we're keeping from the incoming data:
+// MAGIC 
+// MAGIC * `geocoding` (`OBJECT`): Added by the server, this field contains IP address geocoding information for anonymous edits.
+// MAGIC   We're keeping some of it.
+// MAGIC * `isAnonymous` (`BOOLEAN`): Whether or not the change was made by an anonymous user.
+// MAGIC * `namespace` (`STRING`): The page's namespace. See <https://en.wikipedia.org/wiki/Wikipedia:Namespace> Some examples:
+// MAGIC     * "special": This is a special page (i.e., its name begins with "Special:")
+// MAGIC     * "user": the page is a user's home page.
+// MAGIC     * "talk": a discussion page about a particular real page
+// MAGIC     * "category": a page about a category
+// MAGIC     * "file": a page about an uploaded file
+// MAGIC     * "media": a page about some kind of media
+// MAGIC     * "template": a template page
+// MAGIC * `pageURL` (`STRING`): The URL of the page that was edited.
+// MAGIC * `page`: (`STRING`): The printable name of the page that was edited
+// MAGIC * `timestamp` (`STRING`): The time the edit occurred, in [ISO-8601](https://en.wikipedia.org/wiki/ISO_8601) format
+// MAGIC * `user` (`STRING`): The user who made the edit or, if the edit is anonymous, the IP address associated with the anonymous editor.
+// MAGIC * `wikipedia` (`STRING`): The short name of the Wikipedia that was edited (e.g., "en" for the English Wikipedia, "es" for the Spanish Wikipedia, etc.).
+// MAGIC 
+// MAGIC #### The fields we're ignoring:
+// MAGIC 
+// MAGIC * `channel` (`STRING`): The Wikipedia IRC channel, e.g., "#en.wikipedia"
+// MAGIC * `comment` (`STRING`): The comment associated with the change (i.e., the commit message).
+// MAGIC * `delta` (`INT`): The number of lines changes, deleted, and/or added.
+// MAGIC * `flag`: Various flags about the edit.
+// MAGIC     * "m" means the user marked the edit as "minor".
+// MAGIC     * "N" means the page is new.
+// MAGIC     * "b" means the page was edited by a 'bot.
+// MAGIC     * "!" means the page is unpatrolled. (See below.)
+// MAGIC * `isNewPage` (`BOOLEAN`): Whether or not the edit created a new page.
+// MAGIC * `isRobot` (`BOOLEAN`): Whether the edit was made by a robot (`true`) or a human (`false`).
+// MAGIC * `isUnpatrolled` (`BOOLEAN`): Whether or not the article is patrolled. See <https://en.wikipedia.org/wiki/Wikipedia:New_pages_patrol/Unpatrolled_articles>
+// MAGIC * `url` (`STRING`): The URL of the edit diff.
+// MAGIC * `userUrl` (`STRING`): The Wikipedia profile page of the user, if the edit is not anonymous.
+// MAGIC * `wikipediaURL` (`STRING`): The URL of the Wikipedia edition containing the article.
+
+// COMMAND ----------
+
+// MAGIC %md Now that we have the schema, we can parse the JSON in the `value` column. We'll produce a new column called `json`.
+
+// COMMAND ----------
+
+val jsonEdits = editsDF.select(from_json($"value", schema).as("json"), $"timestamp")
+
+// COMMAND ----------
+
+jsonEdits.printSchema
+
+// COMMAND ----------
+
+val editsFinalDF = jsonEdits
+  .select($"json.wikipedia".as("wikipedia"),
+          $"json.isAnonymous".as("isAnonymous"),
+          $"json.namespace".as("namespace"),
+          $"json.page".as("page"),
+          $"json.pageURL".as("pageURL"),
+          $"json.geocoding".as("geocoding"),
+          unix_timestamp($"json.timestamp", "yyyy-MM-dd'T'HH:mm:ss.SSSX").cast("timestamp").as("timestamp"),
+          $"json.user".as("user"))
+
+
+// COMMAND ----------
+
+editsFinalDF.printSchema
+
+// COMMAND ----------
+
+val anonDF = editsFinalDF.filter($"namespace" === "article")
+                         .filter($"isAnonymous" === true)
+                         .filter($"wikipedia" === "en")
+                         .filter(! isnull($"geocoding.countryCode3"))
+
+// COMMAND ----------
+
+display(
+  anonDF.groupBy(window($"timestamp", "1 second", "500 milliseconds"), $"geocoding.countryCode3").count()
+)
+
+// COMMAND ----------
+
+// MAGIC %md
+// MAGIC ### Batch analysis
+// MAGIC 
+// MAGIC We can also do some batch analysis on the stream, by dumping it to an output sink. In this instance, for simplicity, we'll dump it to an in-memory table, but we could just as easily dump it to a Parquet file.
+// MAGIC 
+// MAGIC Note that we're calling `writeStream()` on our DataFrame. This is analogous to calling `write` on a static DataFrame, but it returns a `DataStreamWriter`, instead of a `DataFrameWriter`. We're going to name our in-memory table "wikiedits".
+
+// COMMAND ----------
+
+val editsQuery = anonDF
+  .writeStream
+  .format("memory")
+  .queryName("wikiedits")
+  .start()
+
+// COMMAND ----------
+
+// MAGIC %md 
+// MAGIC We get back a `StreamingQuery` object that allows us to query the status of the running stream, among other things:
+
+// COMMAND ----------
+
+editsQuery
+
+// COMMAND ----------
+
+// MAGIC %md
+// MAGIC Let's look at some of the things we can do with the query object.
+
+// COMMAND ----------
+
+editsQuery.name
+
+// COMMAND ----------
+
+editsQuery.status
+
+// COMMAND ----------
+
+editsQuery.explain()
+
+// COMMAND ----------
+
+editsQuery.lastProgress
+
+// COMMAND ----------
+
+// MAGIC %md 
+// MAGIC 
+// MAGIC We will also use the query object to shut the query down, when we're done with it.
+
+// COMMAND ----------
+
+// MAGIC %md 
+// MAGIC 
+// MAGIC Okay, our query has been running for a few minutes. Let's see what's in our table.
+
+// COMMAND ----------
+
+val df = spark.table("wikiedits")
+
+// COMMAND ----------
+
+df.count
+
+// COMMAND ----------
+
+df.printSchema
+
+// COMMAND ----------
+
+df.count
+
+// COMMAND ----------
+
+display(df)
+
+// COMMAND ----------
+
+// Just re-execute this cell to see the map update.
+display(df.select($"geocoding.countryCode3".as("country")).groupBy("country").count())
+
+// COMMAND ----------
+
+editsQuery.stop
